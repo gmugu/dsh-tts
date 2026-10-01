@@ -795,6 +795,7 @@ window.__ModuleLoader__.load({
         for (const message of messages) seen.add(message.messageId);
         if (fresh.length === 0) return;
         const latest = fresh[fresh.length - 1];
+        console.debug('[dsh-tts] auto-read triggers', latest.messageId, `(${latest.text.length} chars)`);
         controller.start(latest.messageId, latest.text);
       });
     }
@@ -1017,10 +1018,12 @@ window.__ModuleLoader__.load({
       const controller = new TtsController(settings);
       ctx.effect(() => () => controller.dispose(), 'dsh-tts: playback controller');
 
-      // One auto-read watcher per session, reused across slot remounts.
+      // One auto-read watcher per session. The chat binding is recreated by
+      // connection resets / session rebinds — the old one goes silent, so a
+      // stored watcher must be replaced when the live binding differs.
       const autoWatchers = new Map();
       ctx.effect(() => () => {
-        for (const dispose of autoWatchers.values()) dispose();
+        for (const record of autoWatchers.values()) record.dispose();
         autoWatchers.clear();
       }, 'dsh-tts: auto-read watchers');
 
@@ -1036,8 +1039,14 @@ window.__ModuleLoader__.load({
           } catch {
             chat = undefined;
           }
-          if (chat !== undefined && !autoWatchers.has(sessionId)) {
-            autoWatchers.set(sessionId, watchAutoRead(chat, settings, controller));
+          if (chat !== undefined) {
+            const previous = autoWatchers.get(sessionId);
+            if (previous === undefined || previous.chat !== chat) {
+              previous?.dispose();
+              const dispose = watchAutoRead(chat, settings, controller);
+              autoWatchers.set(sessionId, { chat, dispose });
+              console.debug('[dsh-tts] auto-read watcher bound for session', sessionId);
+            }
           }
           return { controller, chat };
         },
