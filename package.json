@@ -1,0 +1,34 @@
+{
+  "name": "dsh-tts",
+  "version": "1.2.0",
+  "description": "TTS read-aloud for DeepSeek Harness: speaker button on assistant messages with Edge online voices, Azure Speech Service (key + region), or browser speechSynthesis, a settings page (service, voice, volume, rate, pitch, auto-read, test), and a reserved cloud TTS engine interface.",
+  "type": "module",
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
+    }
+  }
+}
