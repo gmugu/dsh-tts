@@ -785,12 +785,37 @@ window.__ModuleLoader__.load({
       return found;
     }
 
-    /** Auto-read: speak the newest settled reply once it lands. */
+    /** Whether any assistant node is still streaming (turn not finished). */
+    function hasRunningAssistant(snapshot) {
+      if (snapshot === null || typeof snapshot !== 'object') return false;
+      const nodes = snapshot.nodes;
+      if (nodes === undefined || typeof nodes.values !== 'function') return false;
+      for (const node of nodes.values()) {
+        if (node?.kind === 'assistant-step' && node.data?.status === 'running') return true;
+      }
+      return false;
+    }
+
+    /** Auto-read: speak the newest settled reply once its turn completes. */
     function watchAutoRead(chat, settings, controller) {
       const seen = new Set();
+      let seeded = false;
       return chat.subscribe(() => {
+        const snapshot = chat.getSnapshot();
+        // First observation only registers the history already on screen —
+        // enabling auto-read (or rebinding after a reconnect) never replays
+        // old messages aloud.
+        if (!seeded) {
+          seeded = true;
+          for (const message of settledMessages(snapshot)) seen.add(message.messageId);
+          return;
+        }
         if (!settings.value.autoRead) return;
-        const messages = settledMessages(chat.getSnapshot());
+        // A still-running assistant node means the turn is incomplete: reading
+        // now would speak a partial reply and be interrupted by the next
+        // settle. Wait for the turn to finish (its final event refires this).
+        if (hasRunningAssistant(snapshot)) return;
+        const messages = settledMessages(snapshot);
         const fresh = messages.filter((message) => !seen.has(message.messageId));
         for (const message of messages) seen.add(message.messageId);
         if (fresh.length === 0) return;
