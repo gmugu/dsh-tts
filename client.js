@@ -499,15 +499,23 @@ window.__ModuleLoader__.load({
                 if (cancelled) { URL.revokeObjectURL(url); pending?.catch(() => {}); return; }
                 await new Promise((resolve) => {
                   const audio = new Audio(url);
+                  /** Fully release the element so the browser closes the audio
+                   *  output stream (tab speaker mark / audio device route):
+                   *  pause, drop the source, run load() to flush, revoke URL. */
+                  const release = () => {
+                    audio.pause();
+                    audio.removeAttribute('src');
+                    audio.load();
+                    URL.revokeObjectURL(url);
+                    resolve();
+                  };
                   current = {
                     stop() { audio.pause(); resolve(); },
-                    // Pause BEFORE revoking: revoking the blob URL alone does
-                    // not interrupt an already-buffered/playing element.
-                    drop() { audio.pause(); audio.src = ''; URL.revokeObjectURL(url); resolve(); },
+                    drop() { release(); },
                   };
-                  audio.onended = () => { URL.revokeObjectURL(url); resolve(); };
-                  audio.onerror = () => { URL.revokeObjectURL(url); resolve(); };
-                  audio.play().catch(() => { URL.revokeObjectURL(url); resolve(); });
+                  audio.onended = release;
+                  audio.onerror = release;
+                  audio.play().catch(release);
                 });
                 current = null;
               }
@@ -612,16 +620,24 @@ window.__ModuleLoader__.load({
                 const url = URL.createObjectURL(blob);
                 await new Promise((resolve) => {
                   const audio = new Audio(url);
+                  /** Fully release the element so the browser closes the audio
+                   *  output stream (tab speaker mark / audio device route):
+                   *  pause, drop the source, run load() to flush, revoke URL. */
+                  const release = () => {
+                    audio.pause();
+                    audio.removeAttribute('src');
+                    audio.load();
+                    URL.revokeObjectURL(url);
+                    resolve();
+                  };
                   current = {
                     stop() { audio.pause(); resolve(); },
-                    // Pause BEFORE revoking: revoking the blob URL alone does
-                    // not interrupt an already-buffered/playing element.
-                    drop() { audio.pause(); audio.src = ''; URL.revokeObjectURL(url); resolve(); },
+                    drop() { release(); },
                   };
                   audio.volume = Math.min(1, Math.max(0, options.volume / 100));
-                  audio.onended = () => { URL.revokeObjectURL(url); resolve(); };
-                  audio.onerror = () => { URL.revokeObjectURL(url); resolve(); };
-                  audio.play().catch(() => { URL.revokeObjectURL(url); resolve(); });
+                  audio.onended = release;
+                  audio.onerror = release;
+                  audio.play().catch(release);
                 });
                 current = null;
               }
