@@ -13,10 +13,13 @@ window.__ModuleLoader__.load({
       'nav': 'TTS 朗读',
       'action.read': '朗读',
       'action.stop': '停止朗读',
+      'action.plan.read': '朗读计划',
       'settings.engine': '语音合成服务',
       'settings.engine.local': '浏览器本地合成',
       'settings.engine.edge': 'Edge 在线语音（免密钥）',
       'settings.engine.azure': 'Azure 语音服务（官方接口）',
+      'settings.engine.qwen': '千问 Token Plan（套餐额度）',
+      'settings.qwen.hint': '使用宿主已配置的 QWEN_TOKEN_PLAN_CN_API_KEY（千问 Token 套餐密钥，非百炼），按字符消耗套餐额度，无需在浏览器填密钥。',
       'settings.azure.region': 'Azure 区域 (Region)',
       'settings.azure.key': 'Azure 密钥 (Key)',
       'settings.azure.hint': '在 Azure Portal 的语音资源“密钥和终结点”页获取；区域填资源所在区域（如 eastus、southeastasia）。免费层 F0 每月含 50 万字符 neural 配额。',
@@ -37,10 +40,13 @@ window.__ModuleLoader__.load({
       'nav': 'TTS Read Aloud',
       'action.read': 'Read aloud',
       'action.stop': 'Stop reading',
+      'action.plan.read': 'Read plan aloud',
       'settings.engine': 'Speech service',
       'settings.engine.local': 'Browser speechSynthesis',
       'settings.engine.edge': 'Edge online voices (no key)',
       'settings.engine.azure': 'Azure Speech Service',
+      'settings.engine.qwen': 'Qwen Token Plan (subscription quota)',
+      'settings.qwen.hint': 'Uses the QWEN_TOKEN_PLAN_CN_API_KEY stored on the host (Qwen Token Plan subscription, not Bailian); characters count against the plan quota. No key needed in the browser.',
       'settings.azure.region': 'Azure region',
       'settings.azure.key': 'Azure key',
       'settings.azure.hint': "Get both from your Speech resource's “Keys and Endpoint” page in the Azure portal (region e.g. eastus, southeastasia). The free F0 tier includes 0.5M neural characters per month.",
@@ -78,27 +84,76 @@ window.__ModuleLoader__.load({
         .trim();
     }
 
-    /** Split long text into utterance-sized chunks. */
+    /** Hard-cut fallback for a single segment that still exceeds the limit
+     *  (no punctuation at all, e.g. a long URL) — used only as a last resort.
+     *  Latin-heavy text is cut at a word boundary (space) instead of through
+     *  the middle of a word. */
+    function hardCut(piece, limit) {
+      const out = [];
+      while (piece.length > limit) {
+        let cut = limit;
+        if (/[A-Za-z]/.test(piece.slice(Math.max(0, limit - 30), limit))) {
+          const space = piece.lastIndexOf(' ', limit);
+          if (space > limit * 0.6) cut = space + 1;
+        }
+        out.push(piece.slice(0, cut));
+        piece = piece.slice(cut);
+      }
+      if (piece !== '') out.push(piece);
+      return out;
+    }
+
+    /** Split one overlong sentence at secondary boundaries: commas and — for
+     *  Latin text — word spaces, so English is never cut mid-word. */
+    function splitLongSentence(sentence, limit) {
+      const parts = sentence.match(/[^,，、;;::——– ]+[,，、;;::——– ]*/g) ?? [sentence];
+      const out = [];
+      let buffer = '';
+      for (const part of parts) {
+        if (buffer !== '' && buffer.length + part.length > limit) {
+          out.push(buffer);
+          buffer = part;
+        } else {
+          buffer += part;
+        }
+      }
+      if (buffer !== '') out.push(buffer);
+      // No secondary punctuation either → hard cut.
+      return out.flatMap((piece) => (piece.length > limit ? hardCut(piece, limit) : [piece]));
+    }
+
+    /** Placeholder shielding decimal points ("3.14", "v1.2.3") from being
+     *  read as sentence terminators during the split. */
+    const DECIMAL_SHIELD = '\u0001';
+    const shieldDecimals = (text) => text.replace(/(\d)[.](\d)/g, `$1${DECIMAL_SHIELD}$2`);
+    const unshieldDecimals = (text) => text.split(DECIMAL_SHIELD).join('.');
+
+    /** Split long text into utterance-sized chunks, packing WHOLE sentences:
+     *  primary boundaries are sentence terminators (。！？；!?;. and line
+     *  breaks; a "." between digits is a decimal, NOT a terminator), never a
+     *  hard cut mid-sentence; an overlong sentence first falls back to
+     *  comma-level boundaries, and only a segment without any punctuation is
+     *  hard-cut (Latin text at word boundaries). */
     function chunkText(text, limit = 200) {
       const chunks = [];
       let buffer = '';
-      const sentences = text.match(/[^。！？；!?;.]+[。！？；!?;.]*\s*|\n+/g) ?? [text];
+      const sentences = shieldDecimals(text)
+        .match(/[^。！？；!?;\n]+[。！？；!?;.]*\n*|\n+/g) ?? [shieldDecimals(text)];
       for (const sentence of sentences) {
-        let piece = sentence;
-        while (piece.length > limit) {
-          if (buffer !== '') { chunks.push(buffer); buffer = ''; }
-          chunks.push(piece.slice(0, limit));
-          piece = piece.slice(limit);
-        }
-        if (buffer.length + piece.length > limit && buffer !== '') {
-          chunks.push(buffer);
-          buffer = piece;
-        } else {
-          buffer += piece;
+        const pieces = sentence.length > limit ? splitLongSentence(sentence, limit) : [sentence];
+        for (const piece of pieces) {
+          if (buffer !== '' && buffer.length + piece.length > limit) {
+            chunks.push(buffer);
+            buffer = piece;
+          } else {
+            buffer += piece;
+          }
         }
       }
       if (buffer !== '') chunks.push(buffer);
-      return chunks.filter((chunk) => chunk.trim() !== '');
+      return chunks
+        .filter((chunk) => chunk.trim() !== '')
+        .map(unshieldDecimals);
     }
 
     /** Rough language pick: any CJK char -> zh, otherwise en. */
@@ -229,6 +284,18 @@ window.__ModuleLoader__.load({
       ko: 'ko-KR-SunHiNeural',
     };
 
+    /**
+     * Qwen Token Plan TTS voices — the gateway rejects CosyVoice names
+     * (Engine error 411); only this model's own set works (verified live).
+     * All three support Chinese (Mandarin) and English.
+     */
+    const QWEN_VOICES = [
+      { name: 'longanhuan_v3.6', label: '龙安欢 Longanhuan (女, 默认)' },
+      { name: 'longanlingxin', label: '龙安凌心 Lingxin (女, 温暖)' },
+      { name: 'longanlufeng', label: '龙安露锋 Lufeng (男, 明亮)' },
+    ];
+    const QWEN_AUTO_VOICE = 'longanhuan_v3.6';
+
     // ---------------------------------------------------------------------------
     // Engine layer — one interface, two implementations
     //
@@ -247,6 +314,7 @@ window.__ModuleLoader__.load({
     // silent clip, and reuse it for every utterance afterwards.
     const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
     let sharedAudio = null;
+    let sharedCtx = null;
     let audioUnlocked = false;
     /** True while the shared element carries a playing/settling utterance. */
     let audioInUse = false;
@@ -260,11 +328,27 @@ window.__ModuleLoader__.load({
       return sharedAudio;
     }
 
+    /** Lazily-created shared AudioContext for the PCM Web Audio sink. iOS
+     *  keeps it suspended until a resume() inside a user gesture. */
+    function sharedAudioContext() {
+      if (sharedCtx === null) {
+        const AC = window.AudioContext ?? window.webkitAudioContext;
+        if (AC === undefined) return null;
+        sharedCtx = new AC();
+      }
+      return sharedCtx;
+    }
+
     /** Unlock the shared element inside the gesture it is called from.
      *  NEVER while speech is using the element: swapping src mid-playback
      *  would cut the utterance off. A blocked attempt retries on the next
-     *  interaction until it succeeds. */
+     *  interaction until it succeeds. The AudioContext resumes here too —
+     *  iOS requires the same gesture for Web Audio. */
     function unlockAudio() {
+      const ctx = sharedAudioContext();
+      if (ctx !== null && ctx.state === 'suspended') {
+        ctx.resume().catch(() => { /* retry on the next gesture */ });
+      }
       if (audioUnlocked || audioInUse || typeof window === 'undefined') return;
       const audio = sharedAudioElement();
       if (audio.currentSrc !== '' || !audio.paused) return;
@@ -274,10 +358,15 @@ window.__ModuleLoader__.load({
         played.then(() => {
           // The element played once inside a gesture: blessed from now on.
           audioUnlocked = true;
-          for (const [type, listener] of unlockListeners) {
-            window.removeEventListener(type, listener, { capture: true });
+          // Keep the gesture listeners while the AudioContext still needs a
+          // resume; drop them once both channels are unlocked.
+          const ctxSettled = sharedCtx === null || sharedCtx.state === 'running';
+          if (ctxSettled) {
+            for (const [type, listener] of unlockListeners) {
+              window.removeEventListener(type, listener, { capture: true });
+            }
+            unlockListeners.length = 0;
           }
-          unlockListeners.length = 0;
           // Speech may have claimed the element while this promise was in
           // flight — never pause/flush it then, that would cut the utterance.
           if (audioInUse) return;
@@ -684,6 +773,38 @@ window.__ModuleLoader__.load({
       return response.blob();
     }
 
+    /**
+     * Sequential playback over a sliding prefetch window: keep `windowSize`
+     * synthesis requests in flight ahead of the chunk currently playing.
+     * Chunks play strictly in order; a synthesis failure aborts the run (the
+     * caller decides whether to skip to the next message). Results are
+     * wrapped so a queued promise never becomes an unhandled rejection when
+     * playback is cancelled mid-window.
+     */
+    async function runPrefetchedPlayback(chunks, synthesize, windowSize, isCancelled, playChunk) {
+      let nextIndex = 0;
+      const inflight = [];
+      const fill = () => {
+        while (inflight.length < windowSize && nextIndex < chunks.length) {
+          const index = nextIndex++;
+          inflight.push(
+            Promise.resolve()
+              .then(() => synthesize(chunks[index]))
+              .then((result) => ({ result }), (error) => ({ error })),
+          );
+        }
+      };
+      fill();
+      while (inflight.length > 0) {
+        const settled = await inflight.shift();
+        fill();
+        if (isCancelled()) return;
+        if (settled.error !== undefined) throw settled.error;
+        await playChunk(settled.result);
+        if (isCancelled()) return;
+      }
+    }
+
     function createAzureEngine(settings) {
       return {
         id: 'azure',
@@ -710,49 +831,42 @@ window.__ModuleLoader__.load({
           let current = null;
           (async () => {
             try {
-              /** Prefetch pipeline: synthesize chunk i+1 while chunk i plays. */
+              /** Sliding prefetch window: keep `windowSize` synthesis requests
+               *  in flight ahead of playback for extra scheduling margin. */
               const synthesize = (chunk) => azureSynthesizeChunk(chunk, options, controller.signal, auth);
-              let pending = synthesize(chunks[0]);
-              for (let index = 0; index < chunks.length; index++) {
-                if (cancelled) { pending.catch(() => {}); return; }
-                const blob = await pending;
-                if (cancelled) return;
-                pending = index + 1 < chunks.length ? synthesize(chunks[index + 1]) : null;
-                if (blob === null || blob.size === 0) continue;
+              await runPrefetchedPlayback(chunks, synthesize, 2, () => cancelled, (blob) => new Promise((resolve) => {
+                if (blob === null || blob.size === 0) { resolve(); return; }
                 const url = URL.createObjectURL(blob);
-                await new Promise((resolve) => {
-                  // Shared, gesture-unlocked element (iOS autoplay policy).
-                  const audio = sharedAudioElement();
-                  audio.src = url;
-                  /** Detach the element from this chunk and let the browser
-                   *  close the audio output stream: pause, drop the source,
-                   *  run load() to flush, revoke the blob URL. */
-                  const release = () => {
-                    audioInUse = false;
-                    audio.pause();
-                    audio.removeAttribute('src');
-                    audio.load();
-                    URL.revokeObjectURL(url);
-                    resolve();
-                  };
-                  current = {
-                    stop() { audio.pause(); resolve(); },
-                    drop() { release(); },
-                  };
-                  // Volume is already applied in the SSML prosody server-side;
-                  // setting audio.volume too would attenuate it twice.
-                  audio.onended = release;
-                  audio.onerror = release;
-                  audioInUse = true;
-                  audio.play().catch((error) => {
-                    if (error?.name === 'NotAllowedError') {
-                      console.warn('[dsh-tts] 自动播放被系统拒绝：请先点击一次页面任意位置以解锁声音（iOS PWA 首次使用需要）');
-                    }
-                    release();
-                  });
+                // Shared, gesture-unlocked element (iOS autoplay policy).
+                const audio = sharedAudioElement();
+                audio.src = url;
+                /** Detach the element from this chunk and let the browser
+                 *  close the audio output stream: pause, drop the source,
+                 *  run load() to flush, revoke the blob URL. */
+                const release = () => {
+                  audioInUse = false;
+                  audio.pause();
+                  audio.removeAttribute('src');
+                  audio.load();
+                  URL.revokeObjectURL(url);
+                  resolve();
+                };
+                current = {
+                  stop() { audio.pause(); resolve(); },
+                  drop() { release(); },
+                };
+                // Volume is already applied in the SSML prosody server-side;
+                // setting audio.volume too would attenuate it twice.
+                audio.onended = release;
+                audio.onerror = release;
+                audioInUse = true;
+                audio.play().catch((error) => {
+                  if (error?.name === 'NotAllowedError') {
+                    console.warn('[dsh-tts] 自动播放被系统拒绝：请先点击一次页面任意位置以解锁声音（iOS PWA 首次使用需要）');
+                  }
+                  release();
                 });
-                current = null;
-              }
+              }));
               if (!cancelled) handlers.onEnd();
             } catch (error) {
               if (!cancelled) handlers.onError(error);
@@ -770,9 +884,394 @@ window.__ModuleLoader__.load({
       };
     }
 
+    // --- Qwen Token Plan engine (host-proxied SSE streaming) -----------------
+
+    function base64ToBytes(b64) {
+      const binary = atob(b64);
+      const out = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+      return out;
+    }
+
+    /** Detach the shared element and close the audio output stream. */
+    const releaseSharedAudio = () => {
+      audioInUse = false;
+      const audio = sharedAudioElement();
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+    };
+
+    /**
+     * Async iterator of MP3 byte pieces from the host's SSE passthrough.
+     * The gateway emits sentence-begin / sentence-synthesis (base64 audio) /
+     * sentence-end / final events; only the audio matters here. Measured:
+     * first byte in ~0.65s, each piece ≈ 1.4s of audio.
+     */
+    async function* qwenSseAudioPieces(response) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+        let split;
+        while ((split = buffer.indexOf('\n\n')) >= 0) {
+          const rawEvent = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          const data = rawEvent.split('\n')
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5))
+            .join('\n');
+          if (data === '' || data === '[DONE]') continue;
+          let event;
+          try {
+            event = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          if (event?.code !== undefined && event?.code !== null) {
+            throw new Error(`qwen-tts: ${event.code} ${event?.message ?? ''}`.trim());
+          }
+          const b64 = event?.output?.audio?.data;
+          if (typeof b64 === 'string' && b64 !== '') yield base64ToBytes(b64);
+        }
+      }
+    }
+
+    /**
+     * MediaSource sink: append MP3 pieces for gapless progressive playback
+     * (Chromium/Firefox support audio/mpeg in MSE). Returns null where it is
+     * unsupported — Safari/iOS — so the caller falls back to the sink below.
+     */
+    function createMseSink() {
+      if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported?.('audio/mpeg')) return null;
+      const mediaSource = new MediaSource();
+      const audio = sharedAudioElement();
+      const url = URL.createObjectURL(mediaSource);
+      audio.src = url;
+      audioInUse = true;
+      let sourceBuffer = null;
+      let queue = [];
+      let ended = false;
+      let failure = null;
+      const flush = () => {
+        if (failure !== null) return;
+        if (sourceBuffer === null) return;
+        if (queue.length === 0) {
+          if (ended && !sourceBuffer.updating && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch { /* already ended */ }
+          }
+          return;
+        }
+        if (sourceBuffer.updating) return;
+        try {
+          sourceBuffer.appendBuffer(queue.shift());
+        } catch (error) {
+          failure = error;
+        }
+      };
+      mediaSource.addEventListener('sourceopen', () => {
+        try {
+          sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+        } catch (error) {
+          failure = error;
+          return;
+        }
+        sourceBuffer.addEventListener('updateend', flush);
+        flush();
+        audio.play().catch((error) => {
+          if (error?.name === 'NotAllowedError') {
+            console.warn('[dsh-tts] 自动播放被系统拒绝：请先点击一次页面任意位置以解锁声音（iOS PWA 首次使用需要）');
+          }
+        });
+      });
+      return {
+        append(piece) {
+          if (failure !== null) return Promise.reject(failure);
+          queue.push(piece);
+          flush();
+          return Promise.resolve();
+        },
+        finished() {
+          ended = true;
+          flush();
+          return new Promise((resolve) => {
+            audio.onended = () => { releaseSharedAudio(); URL.revokeObjectURL(url); resolve(); };
+            audio.onerror = () => { releaseSharedAudio(); URL.revokeObjectURL(url); resolve(); };
+          });
+        },
+        stop() {
+          releaseSharedAudio();
+          URL.revokeObjectURL(url);
+        },
+      };
+    }
+
+    /**
+     * PCM Web Audio sink for the streaming engine: the gateway streams RAW
+     * s16le PCM pieces, which have no inter-frame dependencies (unlike MP3,
+     * whose bit reservoir made per-piece decoding sound rustly). Each piece
+     * is converted to an AudioBuffer and scheduled sample-accurately at the
+     * running playhead — gapless AND artifact-free. Bandwidth is ~48 KB/s.
+     */
+    function createPcmSink(sampleRate) {
+      const ctx = sharedAudioContext();
+      if (ctx === null) return null;
+      const gain = ctx.createGain();
+      gain.connect(ctx.destination);
+      const sources = [];
+      let stopped = false;
+      let playheadEnd = 0;
+      let sawAudio = false;
+      let settled = false;
+      let finishResolve = null;
+      let finishReject = null;
+      const finishedPromise = new Promise((resolve, reject) => { finishResolve = resolve; finishReject = reject; });
+      audioInUse = true;
+
+      /** Schedule one PCM piece; while the context is still suspended (no
+       *  user gesture yet) the piece is parked until it runs. */
+      const parked = [];
+      const schedule = (bytes) => {
+        const frames = Math.floor(bytes.byteLength / 2);
+        if (frames === 0) return;
+        const ints = new Int16Array(bytes.buffer, bytes.byteOffset, frames);
+        const buffer = ctx.createBuffer(1, frames, sampleRate);
+        const channel = buffer.getChannelData(0);
+        for (let i = 0; i < frames; i++) channel[i] = ints[i] / 32768;
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(gain);
+        const startAt = Math.max(ctx.currentTime + 0.05, playheadEnd);
+        source.start(startAt);
+        sources.push(source);
+        playheadEnd = startAt + buffer.duration;
+        sawAudio = true;
+      };
+
+      const onState = () => {
+        if (ctx.state !== 'running') return;
+        for (const piece of parked.splice(0, parked.length)) schedule(piece);
+        checkFinished();
+      };
+      ctx.addEventListener('statechange', onState);
+
+      const checkFinished = () => {
+        if (stopped || settled) return;
+        if (parked.length > 0 || ctx.state !== 'running') return;
+        if (playheadEnd <= ctx.currentTime + 0.05) {
+          settled = true;
+          audioInUse = false;
+          try { gain.disconnect(); } catch { /* noop */ }
+          if (sawAudio) finishResolve();
+          else finishReject(new Error('qwen-tts: 未收到任何音频数据'));
+        }
+      };
+      const finishTimer = setInterval(checkFinished, 500);
+
+      return {
+        append(piece) {
+          if (stopped) return Promise.resolve();
+          if (ctx.state === 'running') schedule(piece);
+          else parked.push(piece);
+          return Promise.resolve();
+        },
+        finished() {
+          // The stream's end does not end the audio; resolve when the
+          // playhead drains.
+          return finishedPromise.finally(() => {
+            clearInterval(finishTimer);
+            ctx.removeEventListener('statechange', onState);
+          });
+        },
+        stop() {
+          if (stopped) return;
+          stopped = true;
+          settled = true;
+          clearInterval(finishTimer);
+          ctx.removeEventListener('statechange', onState);
+          for (const source of sources) {
+            try { source.stop(); } catch { /* already ended */ }
+          }
+          try { gain.disconnect(); } catch { /* noop */ }
+          audioInUse = false;
+          finishResolve();
+        },
+      };
+    }
+
+    /** Bytes of MP3 to buffer before the FIRST blob starts playing on the
+     *  sequential sink (≈4s at 48 kbps). Starting on the first tiny piece
+     *  caused rapid blob switches — each src swap costs a decode gap on
+     *  Safari/iOS — heard as stutter at the beginning of playback. */
+    const SEQUENCE_START_THRESHOLD_BYTES = 24576;
+
+    /**
+     * Sequential-blob sink (Safari/iOS fallback): buffer a few seconds of
+     * audio before the first play; while it plays, later pieces accumulate
+     * and the next switch plays everything received so far — few switches
+     * total, so the per-switch decode gap is rarely audible.
+     */
+    function createSequenceSink() {
+      const audio = sharedAudioElement();
+      audioInUse = true;
+      const pending = [];
+      let pendingBytes = 0;
+      let started = false;
+      let stopped = false;
+      let streamEnded = false;
+      let idle = true;
+      let finishResolve = null;
+      const finishedPromise = new Promise((resolve) => { finishResolve = resolve; });
+
+      const settleIfDone = () => {
+        if (idle && pending.length === 0 && streamEnded) {
+          releaseSharedAudio();
+          finishResolve();
+        }
+      };
+
+      const playNext = () => {
+        if (stopped) return;
+        if (pending.length === 0) {
+          idle = true;
+          settleIfDone();
+          return;
+        }
+        idle = false;
+        pendingBytes = 0;
+        const blob = new Blob(pending.splice(0, pending.length), { type: 'audio/mpeg' });
+        const url = URL.createObjectURL(blob);
+        audio.src = url;
+        const advance = () => { URL.revokeObjectURL(url); playNext(); };
+        audio.onended = advance;
+        audio.onerror = advance;
+        audio.play().catch((error) => {
+          if (error?.name === 'NotAllowedError') {
+            console.warn('[dsh-tts] 自动播放被系统拒绝：请先点击一次页面任意位置以解锁声音（iOS PWA 首次使用需要）');
+          }
+          advance();
+        });
+      };
+
+      return {
+        append(piece) {
+          pending.push(piece);
+          pendingBytes += piece.byteLength ?? piece.length ?? 0;
+          // First play waits for the start threshold (or stream end) so the
+          // opening is not chopped into tiny blobs; afterwards flush freely.
+          if (!started && (pendingBytes >= SEQUENCE_START_THRESHOLD_BYTES || streamEnded)) {
+            started = true;
+            playNext();
+          } else if (started && idle) {
+            playNext();
+          }
+          return Promise.resolve();
+        },
+        async finished() {
+          streamEnded = true;
+          if (!started) {
+            started = true;
+            playNext();
+          }
+          settleIfDone();
+          await finishedPromise;
+        },
+        stop() {
+          stopped = true;
+          releaseSharedAudio();
+          finishResolve();
+        },
+      };
+    }
+
+    function createQwenEngine() {
+      return {
+        id: 'qwen',
+        available: true,
+        speak(request, handlers) {
+          const text = stripMarkdown(request.text);
+          if (text.trim() === '') { handlers.onEnd(); return { cancel() {} }; }
+          const controller = new AbortController();
+          let cancelled = false;
+          let sink = null;
+          (async () => {
+            try {
+              // Channel selection up front, because the CODEC depends on it:
+              // - MSE (Chromium/Firefox): MP3, appended gaplessly.
+              // - Web Audio (Safari/iOS): raw PCM, scheduled sample-accurate
+              //   gapless (MP3 cannot be split per piece — bit reservoir).
+              // - Sequential blobs (no Web Audio at all): MP3 element play.
+              const useMse = typeof MediaSource !== 'undefined'
+                && MediaSource.isTypeSupported?.('audio/mpeg') === true;
+              const usePcm = !useMse && sharedAudioContext() !== null;
+              // ONE streaming request for the whole text: the gateway splits
+              // sentences itself (natural prosody) and streams audio pieces;
+              // playback starts with the first piece (~1-2s).
+              const response = await fetch('/dsh-tts/qwen-tts', {
+                method: 'POST',
+                signal: controller.signal,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  text,
+                  format: usePcm ? 'pcm' : 'mp3',
+                  sample_rate: 24000,
+                  voice: request.voice !== '' ? request.voice : QWEN_AUTO_VOICE,
+                  rate: request.rate / 100,
+                  volume: request.volume,
+                  pitch: 1 + request.pitch / 100,
+                }),
+              });
+              if (!response.ok) {
+                let message = `HTTP ${response.status}`;
+                try {
+                  const body = await response.json();
+                  if (body?.message !== undefined) message = String(body.message);
+                  else if (body?.error !== undefined) message = String(body.error);
+                } catch { /* non-JSON error body */ }
+                throw new Error(`qwen-tts: ${message}`);
+              }
+              if (response.body === null) throw new Error('qwen-tts: 宿主未返回音频流');
+              // The host DECLARES the actual codec in a response header —
+              // the only reliable signal (PCM speech bytes often start with
+              // an MP3-like 0xFF 0xFF, so sniffing would misfire). A missing
+              // header means a stale host: fall back to MP3 blob playback.
+              const actualFormat = response.headers.get('x-dsh-tts-format') ?? 'mp3';
+              const pcmStream = usePcm && actualFormat === 'pcm';
+              sink = useMse ? createMseSink() : pcmStream ? createPcmSink(24000) : createSequenceSink();
+              if (usePcm && !pcmStream) {
+                console.warn('[dsh-tts] 宿主未返回 PCM（未重启或旧版），降级为整段播放');
+              }
+              for await (const piece of qwenSseAudioPieces(response)) {
+                if (cancelled) return;
+                await sink.append(piece);
+                if (cancelled) return;
+              }
+              if (cancelled) return;
+              await sink.finished();
+              if (!cancelled) handlers.onEnd();
+            } catch (error) {
+              if (!cancelled) handlers.onError(error);
+            }
+          })();
+          return {
+            cancel() {
+              cancelled = true;
+              controller.abort();
+              sink?.stop();
+            },
+          };
+        },
+        cancel() {},
+      };
+    }
+
     function resolveEngine(id, settings) {
       if (id === 'local') return createLocalEngine();
       if (id === 'azure') return createAzureEngine(settings);
+      if (id === 'qwen') return createQwenEngine();
       return createEdgeEngine();
     }
 
@@ -964,7 +1463,6 @@ window.__ModuleLoader__.load({
         for (const message of messages) seen.add(message.messageId);
         if (fresh.length === 0) return;
         const latest = fresh[fresh.length - 1];
-        console.debug('[dsh-tts] auto-read queues', latest.messageId, `(${latest.text.length} chars)`);
         controller.enqueueAuto(latest.messageId, latest.text);
       });
     }
@@ -1020,6 +1518,149 @@ window.__ModuleLoader__.load({
             : 'var(--dsw-alias-label-tertiary)';
         },
       }, playing ? STOP_ICON : SPEAKER_ICON);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Speaker button + auto-read for presented plans (plan review card)
+    // ---------------------------------------------------------------------------
+
+    /** Plan reviews already auto-read. Persisted in localStorage: a pending
+     *  review must not replay after every page reload / PWA relaunch — only
+     *  once per device until it is answered or replaced. */
+    const PLAN_AUTO_READ_SEEN_KEY = 'dsh-tts.planAutoReadSeen';
+
+    function loadPlanAutoReadSeen() {
+      try {
+        return new Set(JSON.parse(window.localStorage.getItem(PLAN_AUTO_READ_SEEN_KEY) ?? '[]'));
+      } catch {
+        return new Set();
+      }
+    }
+
+    function savePlanAutoReadSeen(set) {
+      try {
+        // Keep the most recent 50 identities.
+        window.localStorage.setItem(PLAN_AUTO_READ_SEEN_KEY, JSON.stringify([...set].slice(-50)));
+      } catch { /* storage unavailable: in-memory dedupe only */ }
+    }
+
+    /**
+     * Invisible occupant of the plan review card: enqueues the presented
+     * plan for auto-read when the switch is on. The visible button lives on
+     * the preview pane's floating speaker instead, so this renders nothing.
+     */
+    function PlanReviewAutoRead({ review, requestKey, controller, settings }) {
+      const text = typeof review?.plan === 'string' ? review.plan : '';
+      const speakId = `plan-review:${requestKey ?? review?.callId ?? 'unknown'}`;
+
+      // Auto-read the presented plan once PER DEVICE, when the switch is on.
+      useEffect(() => {
+        const seen = loadPlanAutoReadSeen();
+        const isSeen = () => seen.has(speakId);
+        if (text.trim() === '' || isSeen()) return undefined;
+        const maybeEnqueue = () => {
+          if (!settings.value.autoRead || isSeen()) return;
+          seen.add(speakId);
+          savePlanAutoReadSeen(seen);
+          controller.enqueueAuto(speakId, text);
+        };
+        maybeEnqueue();
+        const off = settings.subscribe(maybeEnqueue);
+        return () => { off(); };
+      }, [controller, settings, speakId, text]);
+
+      return null;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Floating speak button inside each plan preview pane (all platforms)
+    // ---------------------------------------------------------------------------
+
+    const SPEAKER_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6.5 8.5H3.5v7h3L11 19z" fill="currentColor" stroke="none"/><path d="M14.5 9.2a4 4 0 0 1 0 5.6"/><path d="M17 6.7a7.5 7.5 0 0 1 0 10.6"/></svg>';
+    const STOP_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>';
+
+    /**
+     * The plan preview pane body is ui-plan's exclusive keyed seat, and the
+     * tab's context menu needs a right click — which mobile does not have.
+     * So inject one small floating speaker button into every mounted
+     * [data-plan-preview] pane (top-right corner). Panes mount/unmount with
+     * the sidebar; a body-level MutationObserver adds buttons as panes
+     * appear, and pane removal takes its button along (it is a child node).
+     */
+    /** Whether the controller is currently reading ANY plan: the auto-read
+     *  path ids plans as `plan-review:<…>` while the overlay buttons use
+     *  `plan-pane:<…>` — the playing state must cover both. */
+    const planReading = (activeId) => typeof activeId === 'string'
+      && (activeId.startsWith('plan-review:') || activeId.startsWith('plan-pane:'));
+
+    function mountPlanSpeakOverlays(ctx, controller) {
+      if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return () => {};
+      const t = ctx.locale.bind(NS);
+      const buttons = new Set();
+
+      const paint = (button) => {
+        const playing = planReading(controller.activeId);
+        button.innerHTML = playing ? STOP_SVG : SPEAKER_SVG;
+        button.title = playing ? t('action.stop') : t('action.plan.read');
+        button.setAttribute('aria-label', button.title);
+        button.setAttribute('aria-pressed', String(playing));
+        button.style.color = playing ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-secondary)';
+      };
+
+      const paintAll = () => {
+        for (const button of [...buttons]) {
+          if (!button.isConnected) { buttons.delete(button); continue; }
+          paint(button);
+        }
+      };
+
+      const scan = () => {
+        for (const pane of document.querySelectorAll('[data-plan-preview]')) {
+          if (pane.querySelector('[data-dsh-tts-plan-speak]') !== null) continue;
+          const key = pane.getAttribute('data-plan-preview') || 'plan';
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.setAttribute('data-dsh-tts-plan-speak', key);
+          Object.assign(button.style, {
+            position: 'absolute', top: '6px', right: '8px', zIndex: '5',
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            width: '28px', height: '28px', padding: '0', border: 'none', borderRadius: '7px',
+            background: 'var(--dsw-alias-bg-layer-2)', cursor: 'pointer',
+            boxShadow: '0 0 0 1px var(--dsw-alias-border-l1)',
+            WebkitTapHighlightColor: 'transparent',
+          });
+          button.__speakId = `plan-pane:${key}`;
+          button.__pane = pane;
+          button.addEventListener('click', () => {
+            if (planReading(controller.activeId)) { controller.stop(); return; }
+            const text = pane.innerText ?? '';
+            if (text.trim() !== '') controller.start(button.__speakId, text);
+          });
+          // The pane is a plain <section>; anchor the float inside it.
+          const position = getComputedStyle(pane).position;
+          if (position === 'static') pane.style.position = 'relative';
+          pane.appendChild(button);
+          buttons.add(button);
+          paint(button);
+        }
+      };
+
+      let scheduled = false;
+      const schedule = () => {
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(() => { scheduled = false; scan(); });
+      };
+      const observer = new MutationObserver(schedule);
+      observer.observe(document.body, { childList: true, subtree: true });
+      scan();
+      const off = controller.subscribe(paintAll);
+      return () => {
+        observer.disconnect();
+        off();
+        for (const button of buttons) button.remove();
+        buttons.clear();
+      };
     }
 
     // ---------------------------------------------------------------------------
@@ -1083,7 +1724,12 @@ window.__ModuleLoader__.load({
       },
         h('option', { value: 'edge' }, t('settings.engine.edge')),
         h('option', { value: 'azure' }, t('settings.engine.azure')),
+        h('option', { value: 'qwen' }, t('settings.engine.qwen')),
         h('option', { value: 'local' }, t('settings.engine.local')));
+
+      const qwenHint = value.engine === 'qwen'
+        ? h('div', { style: HINT_STYLE }, t('settings.qwen.hint'))
+        : null;
 
       const azureRows = value.engine === 'azure' ? [
         row('settings.azure.region', h('div', null,
@@ -1110,7 +1756,9 @@ window.__ModuleLoader__.load({
       const voiceOptions = value.engine === 'local'
         ? localVoices.map((voice) => h('option', { key: voice.name, value: voice.name },
           `${voice.name} (${voice.lang})`))
-        : NEURAL_VOICES.map((voice) => h('option', { key: voice.name, value: voice.name }, voice.label));
+        : value.engine === 'qwen'
+          ? QWEN_VOICES.map((voice) => h('option', { key: voice.name, value: voice.name }, voice.label))
+          : NEURAL_VOICES.map((voice) => h('option', { key: voice.name, value: voice.name }, voice.label));
       const voiceSelect = h('select', {
         style: CONTROL_STYLE, value: value.voice,
         onChange: (event) => write('voice', event.target.value),
@@ -1155,6 +1803,7 @@ window.__ModuleLoader__.load({
         row('settings.engine', engineSelect, undefined, t),
         ...azureRows,
         azureMissing,
+        qwenHint,
         row('settings.voice', voiceSelect, undefined, t),
         row('settings.volume', h('div', null, slider('volume', 0, 100), h('span', { style: HINT_STYLE }, `${value.volume}%`)), undefined, t),
         row('settings.rate', h('div', null, slider('rate', 50, 200), h('span', { style: HINT_STYLE }, `${value.rate}%`)), undefined, t),
@@ -1202,7 +1851,6 @@ window.__ModuleLoader__.load({
         if (previous !== undefined && previous.chat === chat) return;
         previous?.dispose();
         autoWatchers.set(sessionId, { chat, dispose: watchAutoRead(chat, settings, controller) });
-        console.debug('[dsh-tts] auto-read watcher bound for session', sessionId);
       };
 
       const chatOf = (sessionId) => {
@@ -1254,6 +1902,19 @@ window.__ModuleLoader__.load({
           return { controller, chat };
         },
       }, SpeakAction));
+
+      // Auto-read hook on presented plans (plan review card); renders nothing.
+      ctx.slots.inject('conversation.plan-review.actions', () => ctx.slots.register({
+        name: 'conversation.plan-review.actions',
+        id: 'dsh-tts',
+        order: 30,
+        locale: NS,
+        inject: () => ({ controller, settings }),
+      }, PlanReviewAutoRead));
+
+      // Floating speak/stop button inside every plan preview pane (works on
+      // desktop and mobile alike — no context menu needed).
+      ctx.effect(() => mountPlanSpeakOverlays(ctx, controller), 'dsh-tts: plan speak overlays');
 
       ctx.slots.inject('settings.section', () => ctx.slots.register({
         name: 'settings.section',

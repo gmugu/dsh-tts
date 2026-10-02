@@ -1,11 +1,12 @@
 {
   "name": "dsh-tts",
-  "version": "1.2.0",
-  "description": "TTS read-aloud for DeepSeek Harness: speaker button on assistant messages with Edge online voices, Azure Speech Service (key + region), or browser speechSynthesis, a settings page (service, voice, volume, rate, pitch, auto-read, test), and a reserved cloud TTS engine interface.",
+  "version": "1.4.0",
+  "description": "TTS read-aloud for DeepSeek Harness: speaker button on assistant messages with Edge online voices, Azure Speech Service, Qwen Token Plan (qwen-audio-3.0-tts-plus, SSE streaming through a host proxy), or browser speechSynthesis; plan read-aloud with auto-read; sequential queue and per-device auto-read preference.",
   "type": "module",
   "license": "MIT",
   "dependencies": {
-    "@deepseek-ai/schemastery": "~3.18.4"
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "puppeteer-core": "^25.12.0"
   },
   "exports": {
     ".": "./index.js",
@@ -21,7 +22,9 @@
     "README.md"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,

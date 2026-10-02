@@ -7,13 +7,18 @@ that reads assistant replies aloud in the Web GUI.
 
 - **Speaker button** on every finalized assistant message's action row (next to
   like/dislike): one click reads the message, click again to stop.
-- **Three engines**, switchable in Settings → TTS 朗读:
+- **Four engines**, switchable in Settings → TTS 朗读:
   - **Edge online voices** (default): Microsoft Edge read-aloud free endpoint,
     neural voices (晓晓, 云希, Aria, Guy, …) — no API key required.
   - **Azure Speech Service**: the official
     `https://{region}.tts.speech.microsoft.com/cognitiveservices/v1` REST API
     with your own resource key — enter region + key in settings (free F0 tier
     includes 0.5M neural characters/month). Same neural voice catalog.
+  - **Qwen Token Plan**: `qwen-audio-3.0-tts-plus` via the subscription
+    gateway (`token-plan.cn-beijing.maas.aliyuncs.com`), proxied through a
+    host route (`POST /dsh-tts/qwen-tts`) so the `sk-sp-` plan key never
+    reaches the browser; characters count against the plan quota. Own voice
+    set (龙安欢/凌心/露锋; CosyVoice names are rejected by this model).
   - **Browser speechSynthesis**: offline, system voices.
 - **Settings page** (persisted on the host): speech service, voice (or auto by
   message language), volume, rate, pitch, auto-read of new replies, and a test

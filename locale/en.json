@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "TTS Read Aloud",
-    "description": "Adds a speaker button to each finalized assistant message's action row: Edge online neural voices, Azure Speech Service (official API with region + key), or browser speechSynthesis, with a settings page for service, voice, volume, rate, pitch, auto-read, and test playback."
+    "description": "Adds a speaker button to each finalized assistant message's action row: Edge online neural voices, Azure Speech Service, Qwen Token Plan (host-proxied, plan key stays server-side), or browser speechSynthesis, with sequential auto-read queueing."
   }
 }
