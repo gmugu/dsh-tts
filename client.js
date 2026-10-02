@@ -117,14 +117,33 @@ window.__ModuleLoader__.load({
 
     const DEFAULT_SETTINGS = {
       engine: 'edge', voice: '', azureRegion: '', azureKey: '',
-      volume: 100, rate: 100, pitch: 0, autoRead: false,
+      volume: 100, rate: 100, pitch: 0,
     };
 
-    /** Live view over the settings form (Host-persisted) with an in-memory fallback. */
+    // --- Auto-read switch: browser-local (per device), NOT host-persisted ----
+    const AUTO_READ_KEY = 'dsh-tts.autoRead';
+
+    function readAutoRead() {
+      try {
+        return window.localStorage.getItem(AUTO_READ_KEY) === '1';
+      } catch {
+        return false;
+      }
+    }
+
+    function writeAutoRead(value) {
+      try {
+        window.localStorage.setItem(AUTO_READ_KEY, value ? '1' : '0');
+      } catch { /* storage unavailable (private mode): in-memory only */ }
+    }
+
+    /** Live view over the settings form (Host-persisted) with an in-memory
+     *  fallback; the autoRead flag is overlaid from localStorage. */
     function createSettingsStore(form) {
       const listeners = new Set();
       const notify = () => { for (const listener of listeners) listener(); };
       const memory = { ...DEFAULT_SETTINGS };
+      let autoRead = readAutoRead();
       let live = form;
       let off = live === null ? () => {} : live.subscribe(notify);
       return {
@@ -138,7 +157,8 @@ window.__ModuleLoader__.load({
         },
         get value() {
           const stored = live?.getSnapshot().value ?? null;
-          return stored === null ? memory : { ...DEFAULT_SETTINGS, ...stored };
+          const base = stored === null ? memory : { ...DEFAULT_SETTINGS, ...stored };
+          return { ...base, autoRead };
         },
         get status() { return live === null ? 'unavailable' : live.getSnapshot().status; },
         subscribe(listener) {
@@ -146,6 +166,13 @@ window.__ModuleLoader__.load({
           return () => listeners.delete(listener);
         },
         set: (field, value) => {
+          // The auto-read switch is a per-device preference: localStorage only.
+          if (field === 'autoRead') {
+            autoRead = Boolean(value);
+            writeAutoRead(autoRead);
+            notify();
+            return;
+          }
           memory[field] = value;
           if (live !== null) {
             live.set(field, value).catch((error) => {
@@ -210,6 +237,72 @@ window.__ModuleLoader__.load({
     //   speak(request: { text, lang, voice, volume, rate, pitch }, h: { onEnd, onError }) -> { cancel() }
     // }
     // ---------------------------------------------------------------------------
+
+    // --- Shared, gesture-unlocked audio element ------------------------------
+    //
+    // iOS/WebKit autoplay policy: programmatic play() only works on an element
+    // that has played once INSIDE a user gesture. Per-chunk `new Audio()` is
+    // therefore always rejected on iOS PWA (auto-read dies instantly). Keep
+    // ONE element, unlock it on the first pointer/key interaction with a
+    // silent clip, and reuse it for every utterance afterwards.
+    const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+    let sharedAudio = null;
+    let audioUnlocked = false;
+    /** True while the shared element carries a playing/settling utterance. */
+    let audioInUse = false;
+    const unlockListeners = [];
+
+    function sharedAudioElement() {
+      if (sharedAudio === null) {
+        sharedAudio = new Audio();
+        sharedAudio.preload = 'auto';
+      }
+      return sharedAudio;
+    }
+
+    /** Unlock the shared element inside the gesture it is called from.
+     *  NEVER while speech is using the element: swapping src mid-playback
+     *  would cut the utterance off. A blocked attempt retries on the next
+     *  interaction until it succeeds. */
+    function unlockAudio() {
+      if (audioUnlocked || audioInUse || typeof window === 'undefined') return;
+      const audio = sharedAudioElement();
+      if (audio.currentSrc !== '' || !audio.paused) return;
+      audio.src = SILENT_WAV;
+      const played = audio.play();
+      if (played !== undefined) {
+        played.then(() => {
+          // The element played once inside a gesture: blessed from now on.
+          audioUnlocked = true;
+          for (const [type, listener] of unlockListeners) {
+            window.removeEventListener(type, listener, { capture: true });
+          }
+          unlockListeners.length = 0;
+          // Speech may have claimed the element while this promise was in
+          // flight — never pause/flush it then, that would cut the utterance.
+          if (audioInUse) return;
+          audio.pause();
+          audio.removeAttribute('src');
+          audio.load();
+        }).catch(() => {
+          // Rejected (gesture not accepted, e.g. pointerdown on some WebKit):
+          // clean the source so a later attempt isn't blocked by the
+          // currentSrc check — but only while the element is idle.
+          if (audioInUse) return;
+          audio.removeAttribute('src');
+          audio.load();
+        });
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      // Any first interaction (opening the PWA, tapping send, ...) unlocks.
+      for (const type of ['pointerdown', 'touchend', 'keydown']) {
+        const listener = unlockAudio;
+        unlockListeners.push([type, listener]);
+        window.addEventListener(type, listener, { once: false, capture: true });
+      }
+    }
 
     function createLocalEngine() {
       const supported = typeof window !== 'undefined' && 'speechSynthesis' in window;
@@ -498,11 +591,14 @@ window.__ModuleLoader__.load({
                 const url = URL.createObjectURL(blob);
                 if (cancelled) { URL.revokeObjectURL(url); pending?.catch(() => {}); return; }
                 await new Promise((resolve) => {
-                  const audio = new Audio(url);
-                  /** Fully release the element so the browser closes the audio
-                   *  output stream (tab speaker mark / audio device route):
-                   *  pause, drop the source, run load() to flush, revoke URL. */
+                  // Shared, gesture-unlocked element (iOS autoplay policy).
+                  const audio = sharedAudioElement();
+                  audio.src = url;
+                  /** Detach the element from this chunk and let the browser
+                   *  close the audio output stream: pause, drop the source,
+                   *  run load() to flush, revoke the blob URL. */
                   const release = () => {
+                    audioInUse = false;
                     audio.pause();
                     audio.removeAttribute('src');
                     audio.load();
@@ -515,7 +611,13 @@ window.__ModuleLoader__.load({
                   };
                   audio.onended = release;
                   audio.onerror = release;
-                  audio.play().catch(release);
+                  audioInUse = true;
+                  audio.play().catch((error) => {
+                    if (error?.name === 'NotAllowedError') {
+                      console.warn('[dsh-tts] 自动播放被系统拒绝：请先点击一次页面任意位置以解锁声音（iOS PWA 首次使用需要）');
+                    }
+                    release();
+                  });
                 });
                 current = null;
               }
@@ -619,11 +721,14 @@ window.__ModuleLoader__.load({
                 if (blob === null || blob.size === 0) continue;
                 const url = URL.createObjectURL(blob);
                 await new Promise((resolve) => {
-                  const audio = new Audio(url);
-                  /** Fully release the element so the browser closes the audio
-                   *  output stream (tab speaker mark / audio device route):
-                   *  pause, drop the source, run load() to flush, revoke URL. */
+                  // Shared, gesture-unlocked element (iOS autoplay policy).
+                  const audio = sharedAudioElement();
+                  audio.src = url;
+                  /** Detach the element from this chunk and let the browser
+                   *  close the audio output stream: pause, drop the source,
+                   *  run load() to flush, revoke the blob URL. */
                   const release = () => {
+                    audioInUse = false;
                     audio.pause();
                     audio.removeAttribute('src');
                     audio.load();
@@ -634,10 +739,17 @@ window.__ModuleLoader__.load({
                     stop() { audio.pause(); resolve(); },
                     drop() { release(); },
                   };
-                  audio.volume = Math.min(1, Math.max(0, options.volume / 100));
+                  // Volume is already applied in the SSML prosody server-side;
+                  // setting audio.volume too would attenuate it twice.
                   audio.onended = release;
                   audio.onerror = release;
-                  audio.play().catch(release);
+                  audioInUse = true;
+                  audio.play().catch((error) => {
+                    if (error?.name === 'NotAllowedError') {
+                      console.warn('[dsh-tts] 自动播放被系统拒绝：请先点击一次页面任意位置以解锁声音（iOS PWA 首次使用需要）');
+                    }
+                    release();
+                  });
                 });
                 current = null;
               }
@@ -673,6 +785,8 @@ window.__ModuleLoader__.load({
         this.settings = settings;
         this.activeId = null;
         this.handle = null;
+        /** Queued auto-read items, played strictly in order. */
+        this.queue = [];
         this.listeners = new Set();
       }
 
@@ -684,13 +798,30 @@ window.__ModuleLoader__.load({
 
       #publish() { for (const listener of this.listeners) listener(this.activeId); }
 
+      /** Manual play: interrupt whatever runs and clear the pending queue. */
       start(messageId, text) {
-        if (this.activeId === messageId) return;
+        this.queue.length = 0;
         this.#stopInternal();
         if (text.trim() === '') return;
+        this.#speakNow(messageId, text);
+      }
+
+      /** Auto-read: never interrupts — queued while something is playing. */
+      enqueueAuto(messageId, text) {
+        if (this.activeId === messageId) return;
+        if (this.activeId !== null || this.queue.length > 0) {
+          if (!this.queue.some((item) => item.messageId === messageId)) {
+            this.queue.push({ messageId, text });
+          }
+          return;
+        }
+        this.#speakNow(messageId, text);
+      }
+
+      #speakNow(messageId, text) {
         const settings = this.settings.value;
         const engine = resolveEngine(settings.engine, this.settings);
-        if (!engine.available) return;
+        if (!engine.available) return false;
         this.activeId = messageId;
         this.#publish();
         this.handle = engine.speak(
@@ -703,16 +834,21 @@ window.__ModuleLoader__.load({
             pitch: settings.pitch,
           },
           {
-            onEnd: () => this.#finish(messageId),
+            onEnd: () => this.#advance(messageId),
             onError: (error) => {
               console.error('[dsh-tts]', error);
-              this.#finish(messageId);
+              this.#advance(messageId);
             },
           },
         );
+        return true;
       }
 
-      stop() { this.#stopInternal(); this.#publish(); }
+      stop() {
+        this.queue.length = 0;
+        this.#stopInternal();
+        this.#publish();
+      }
 
       #stopInternal() {
         if (this.handle !== null) {
@@ -722,14 +858,22 @@ window.__ModuleLoader__.load({
         this.activeId = null;
       }
 
-      #finish(messageId) {
+      /** A playback finished (end or error): continue with the next queued item.
+       *  Skips past items whose engine turned unavailable mid-queue (e.g. the
+       *  Azure key was cleared), otherwise the queue would stall forever. */
+      #advance(messageId) {
         if (this.activeId !== messageId) return;
         this.activeId = null;
         this.handle = null;
+        let next = this.queue.shift();
+        while (next !== undefined && !this.#speakNow(next.messageId, next.text)) {
+          next = this.queue.shift();
+        }
+        if (next !== undefined) return;
         this.#publish();
       }
 
-      dispose() { this.#stopInternal(); this.listeners.clear(); }
+      dispose() { this.queue.length = 0; this.#stopInternal(); this.listeners.clear(); }
     }
 
     // ---------------------------------------------------------------------------
@@ -820,8 +964,8 @@ window.__ModuleLoader__.load({
         for (const message of messages) seen.add(message.messageId);
         if (fresh.length === 0) return;
         const latest = fresh[fresh.length - 1];
-        console.debug('[dsh-tts] auto-read triggers', latest.messageId, `(${latest.text.length} chars)`);
-        controller.start(latest.messageId, latest.text);
+        console.debug('[dsh-tts] auto-read queues', latest.messageId, `(${latest.text.length} chars)`);
+        controller.enqueueAuto(latest.messageId, latest.text);
       });
     }
 
@@ -1052,27 +1196,61 @@ window.__ModuleLoader__.load({
         autoWatchers.clear();
       }, 'dsh-tts: auto-read watchers');
 
+      /** Bind (or rebind) the watcher of one session to a live chat binding. */
+      const ensureWatcher = (sessionId, chat) => {
+        const previous = autoWatchers.get(sessionId);
+        if (previous !== undefined && previous.chat === chat) return;
+        previous?.dispose();
+        autoWatchers.set(sessionId, { chat, dispose: watchAutoRead(chat, settings, controller) });
+        console.debug('[dsh-tts] auto-read watcher bound for session', sessionId);
+      };
+
+      const chatOf = (sessionId) => {
+        try {
+          return ctx.uiConversation.binding(sessionId).target('chat');
+        } catch {
+          return undefined;
+        }
+      };
+
+      // Primary binding path: the FOREGROUND session, subscribed as soon as it
+      // opens — before any reply exists, so a conversation's FIRST reply is
+      // auto-read too (the actions-row slot below only renders once some
+      // finalized message exists, which used to skip the first reply).
+      ctx.inject(['uiSession'], (scope) => {
+        let lastSessionId;
+        const sync = () => {
+          const sessionId = scope.uiSession.current.getSnapshot()?.key;
+          if (sessionId !== lastSessionId) {
+            // Playback follows the foreground conversation: leaving a session
+            // stops its speech (its stop button is no longer reachable) and
+            // drops its queued items; the new session reads its own replies.
+            controller.stop();
+            lastSessionId = sessionId;
+          }
+          for (const [id, record] of autoWatchers) {
+            if (id === sessionId) continue;
+            record.dispose();
+            autoWatchers.delete(id);
+          }
+          if (sessionId === undefined) return;
+          const chat = chatOf(sessionId);
+          if (chat !== undefined) ensureWatcher(sessionId, chat);
+        };
+        ctx.effect(() => scope.uiSession.current.subscribe(sync), 'dsh-tts: foreground session watcher');
+        sync();
+      });
+
+      // Fallback binding path: also bind from the actions-row render (covers
+      // clients without uiSession).
       ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({
         name: 'conversation.chat.assistant-actions',
         id: 'dsh-tts',
         order: 20,
         locale: NS,
         inject: (sessionId) => {
-          let chat;
-          try {
-            chat = ctx.uiConversation.binding(sessionId).target('chat');
-          } catch {
-            chat = undefined;
-          }
-          if (chat !== undefined) {
-            const previous = autoWatchers.get(sessionId);
-            if (previous === undefined || previous.chat !== chat) {
-              previous?.dispose();
-              const dispose = watchAutoRead(chat, settings, controller);
-              autoWatchers.set(sessionId, { chat, dispose });
-              console.debug('[dsh-tts] auto-read watcher bound for session', sessionId);
-            }
-          }
+          const chat = chatOf(sessionId);
+          if (chat !== undefined) ensureWatcher(sessionId, chat);
           return { controller, chat };
         },
       }, SpeakAction));

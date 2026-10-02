@@ -27,8 +27,8 @@ export const Config = z.object({
   rate: z.number().default(100).volatile(),
   /** Pitch adjustment: local maps to 0–2 pitch, Edge to ±Hz. -50–50. */
   pitch: z.number().default(0).volatile(),
-  /** Automatically read each finalized assistant reply aloud. */
-  autoRead: z.boolean().default(false).volatile(),
+  // NOTE: the auto-read switch deliberately lives in the browser's
+  // localStorage (client.js), not here — it is a per-device preference.
 });
 
 export function apply(ctx) {
